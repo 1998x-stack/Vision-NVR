@@ -334,6 +334,11 @@ class CameraWorker:
     def _start_event(self, history, ts, score, zones):
         if not self.storage_online or len(self._pending) >= 2:
             return False
+        # Recheck *at the actual start* to avoid writing to the underlying SSD
+        # when the target mount disappeared between periodic health probes.
+        if not self._storage_ok():
+            self.storage_online = False
+            return False
         if not self.store.allow_new_recording():
             return False
         event_wall = history[0][0] if history else time.time()
@@ -401,8 +406,15 @@ class CameraWorker:
         zone_key = None
         last_disk_check = 0.0
         clip_begin = 0.0
+        next_analysis = 0.0
         try:
             while self.running:
+                # V4L2 may deliver 30 fps while analysis/recording is set to 8.
+                # Sample the newest image at target fps so 3*fps really means
+                # about three seconds of preroll, not 24/30 of a second.
+                if time.monotonic() < next_analysis:
+                    time.sleep(min(.025, next_analysis - time.monotonic()))
+                    continue
                 tic = time.monotonic()
                 packet = self.grabber.get(last_seq, timeout=.5)
                 self._reap_encoders()
@@ -418,6 +430,7 @@ class CameraWorker:
                     continue
                 if packet.seq <= last_seq:
                     continue
+                next_analysis = time.monotonic() + 1.0 / self.fps
                 if last_seq:
                     self.frames_skipped += max(0, packet.seq-last_seq-1)
                 last_seq = packet.seq
@@ -443,7 +456,7 @@ class CameraWorker:
                 frame = privacy_redact(self._letterbox(packet.frame), cfg["zones"])
                 score, boxes, motion = self.detector.detect(
                     frame, cfg["sensitivity"], cfg["zones"])
-                if packet.mono_time-last_disk_check > 5:
+                if self._active or packet.mono_time-last_disk_check > 5:
                     last_disk_check = packet.mono_time
                     disk_ok = self._storage_ok()
                     if not disk_ok and self._active:
