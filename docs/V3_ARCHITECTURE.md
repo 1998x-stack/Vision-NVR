@@ -105,6 +105,23 @@ curl -i -H 'Host: not-local.example' http://127.0.0.1:7866/api/status
 
 Test suite covers synthetic motion, background exposure, polygon masking, unsafe coordinates, capture queue pressure, FFmpeg slowdown/failure, encoding/seek, event recovery, consent reset, Host rebinding and end-to-end simulated demo recording.
 
+
+## 24-hour real-camera soak (passive, does not arm recording)
+
+```bash
+# Start NVR on the actual Ubuntu machine and open the UI first.
+# With the consent of everyone recorded, manually enable recording in the UI.
+python scripts/soak_test.py --hours 24 --interval 10 --out nvr-24h.csv
+```
+
+This script samples the **loopback API only** and writes camera/encoding/storage
+metrics to CSV. It does not turn recording on or make the server publicly
+accessible. Nonzero exit status means some samples were offline. Inspect the
+CSV for persistent capture-FPS shortfalls, encoder backlog, frame loss,
+worker restarts, disk space drops and `encoder_failures`. A single CSV test
+cannot establish correctness across power outages; test those manually and
+verify restored MP4 files with `ffprobe`.
+
 ### Hardware qualification needed
 
 Before claiming 24/7 availability on a specific computer, conduct at least a 24h real-webcam trial: verify V4L2 resolution/FPS negotiation, dropped-frame counters, file integrity after camera hot-unplug, USB disconnect recovery, disk unmount behavior, thermal/CPU pressure, and idle CPU. Network RTSP paths are best-effort and have not received real-camera integration testing. The encoder retains constant-fps approximation rather than original high-resolution PTS for every frame.
