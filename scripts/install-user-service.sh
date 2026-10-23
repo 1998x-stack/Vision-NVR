@@ -17,10 +17,14 @@ Type=simple
 WorkingDirectory=$ROOT
 # Resolved at install time: systemd need not find conda in its PATH.
 Environment="NVR_PYTHON=$PYTHON"
+Environment="NVR_DATA_DIR=${NVR_DATA_DIR:-$HOME/.local/share/vision-nvr}"
 ExecStart=/usr/bin/bash "$ROOT/scripts/run.sh"
 Restart=on-failure
 RestartSec=5
 UMask=0077
+Nice=10
+CPUWeight=50
+IOSchedulingClass=idle
 NoNewPrivileges=true
 
 [Install]
