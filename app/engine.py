@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 from datetime import datetime
 import logging
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
+
+from .camera import FrameGrabber
+from .encoder import VideoEncoder  # public backwards-compatibility alias
+from .recorder import AsyncEventRecorder
+from .zones import detection_mask, privacy_redact
 
 import cv2
 import numpy as np
@@ -36,7 +41,7 @@ class MotionDetector:
         self.lighting_events = 0
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-    def detect(self, frame: np.ndarray, threshold: float = 0.65):
+    def detect(self, frame: np.ndarray, threshold: float = 0.65, zones: dict | None = None):
         h, w = frame.shape[:2]
         small = cv2.resize(frame, (self.width, max(1, round(h * self.width / w))))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
@@ -59,8 +64,16 @@ class MotionDetector:
         mask = cv2.threshold(mask, 250, 255, cv2.THRESH_BINARY)[1]  # suppress gray shadow label
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.dilate(mask, self.kernel, iterations=1)
+        allowed_pixels = mask.size
+        if zones is not None:
+            roi = detection_mask(mask.shape[1], mask.shape[0], zones)
+            if roi is not None:
+                allowed_pixels = int(np.count_nonzero(roi))
+                mask = cv2.bitwise_and(mask, roi)
+                if not allowed_pixels:
+                    return 0.0, [], False
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        min_blob = max(110, int(mask.size * 0.002))
+        min_blob = max(20, int(allowed_pixels * 0.002))
         rectangles = []
         significant_area = 0.0
         sx, sy = w / small.shape[1], h / small.shape[0]
@@ -71,7 +84,7 @@ class MotionDetector:
             x, y, ww, hh = cv2.boundingRect(cont)
             significant_area += area
             rectangles.append((int(x * sx), int(y * sy), int(ww * sx), int(hh * sy)))
-        pct = 100.0 * significant_area / mask.size
+        pct = 100.0 * significant_area / allowed_pixels
         self.last_mean = mean
         if self.samples <= self.warmup:
             self.stable_mean = mean
@@ -94,67 +107,13 @@ def level(score: float) -> str:
     return "idle"
 
 
-class VideoEncoder:
-    def __init__(self, path: Path, width: int, height: int, fps: int):
-        binary = shutil.which("ffmpeg")
-        if not binary:
-            raise RuntimeError("找不到 FFmpeg。请先激活含 ffmpeg 的 Conda 环境。")
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._stderr_log = tempfile.TemporaryFile(mode="w+b")
-        self.proc = subprocess.Popen([
-            binary, "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "rawvideo", "-pixel_format", "bgr24", "-video_size", f"{width}x{height}",
-            "-framerate", str(fps), "-i", "pipe:0", "-an", "-c:v", "libx264",
-            "-preset", "veryfast", "-crf", "29", "-pix_fmt", "yuv420p",
-            "-threads", "2", "-g", str(fps * 2),
-            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-            "-f", "mp4", str(path)
-        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._stderr_log)
-        self.frame_count = 0
-        self.fps = fps
-
-    def append(self, frame: np.ndarray):
-        if self.proc.poll() is not None:
-            msg = self._error_tail()
-            raise RuntimeError(f"FFmpeg 录制中断：{msg}")
-        try:
-            self.proc.stdin.write(frame.tobytes())
-            self.frame_count += 1
-        except (BrokenPipeError, OSError) as exc:
-            raise RuntimeError("FFmpeg 无法写入视频；检查磁盘空间与编码支持") from exc
-
-    def _error_tail(self):
-        self._stderr_log.seek(0, os.SEEK_END)
-        end = self._stderr_log.tell()
-        self._stderr_log.seek(max(0, end - 4096))
-        return self._stderr_log.read().decode("utf-8", errors="replace")[-700:]
-
-    def close(self):
-        try:
-            if self.proc.stdin and not self.proc.stdin.closed:
-                try:
-                    self.proc.stdin.close()
-                except BrokenPipeError:
-                    pass
-            try:
-                rc = self.proc.wait(timeout=20)
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError("FFmpeg 结束录制超时") from exc
-            message = self._error_tail()
-            if rc != 0:
-                raise RuntimeError(f"FFmpeg 编码错误（exit {rc}）：{message}")
-            return self.frame_count / self.fps
-        finally:
-            if self.proc.poll() is None:
-                self.proc.kill()
-                self.proc.wait()
-            self._stderr_log.close()
-
 
 class CameraWorker:
-    def __init__(self, store, *, camera: str = "/dev/video0", demo: bool = False, fps: int = 8,
-                 width: int = 640, height: int = 360, require_mount: Path | None = None):
+    """Analyzer/event state machine. Camera reads and video encoding are separate threads."""
+
+    def __init__(self, store, *, camera: str = "/dev/video0", demo: bool = False,
+                 fps: int = 8, width: int = 640, height: int = 360,
+                 require_mount: Path | None = None):
         self.store = store
         self.camera = camera
         self.demo = demo
@@ -165,7 +124,10 @@ class CameraWorker:
         self.condition = threading.Condition(self.lock)
         self.running = False
         self.thread: threading.Thread | None = None
+        self.grabber = FrameGrabber(camera, demo=demo, fps=fps, width=width, height=height)
         self.jpeg: bytes | None = None
+        self.latest_frame: np.ndarray | None = None
+        self.preview_viewers = 0
         self.seq = 0
         self.online = False
         self.state = "offline"
@@ -178,25 +140,37 @@ class CameraWorker:
         self.last_frame = 0.0
         self.last_event_id: str | None = None
         self.frames_processed = 0
+        self.frames_skipped = 0
         self.loop_restarts = 0
         self.last_cleanup_seconds = 0.0
         self.last_cleanup_removed = 0
         self.janitor_stop = threading.Event()
         self.janitor_thread: threading.Thread | None = None
         self.detector = MotionDetector()
-        # Volatile motion indicators for last 180 seconds, never saved to disk.
         self.activity_seconds: deque[tuple[int, str]] = deque(maxlen=180)
+        self.process_timestamps: deque[float] = deque(maxlen=240)
+        self.process_cost_ms: deque[float] = deque(maxlen=240)
+        self.storage_device = store.path.stat().st_dev
+        self.storage_online = True
+        self.storage_guard_stops = 0
+        self.encoder_drops_total = 0
+        self.encoder_duplicates_total = 0
+        self.encoder_failures = 0
+        self.last_encoder_error = ""
+        self._active: AsyncEventRecorder | None = None
+        self._pending: list[AsyncEventRecorder] = []
 
     def start(self):
         if self.thread and self.thread.is_alive():
             return
         self.running = True
         self.janitor_stop.clear()
+        self.grabber.start()
         self.janitor_thread = threading.Thread(
             target=self._janitor, name="nvr-janitor", daemon=True)
         self.janitor_thread.start()
         self.thread = threading.Thread(
-            target=self._supervise, name="camera-supervisor", daemon=True)
+            target=self._supervise, name="nvr-analyzer", daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -204,6 +178,7 @@ class CameraWorker:
         self.janitor_stop.set()
         with self.condition:
             self.condition.notify_all()
+        self.grabber.stop()
         if self.thread:
             self.thread.join(timeout=35)
         if self.janitor_thread:
@@ -211,7 +186,7 @@ class CameraWorker:
 
     def _janitor(self):
         while not self.janitor_stop.is_set():
-            start = time.monotonic()
+            begin = time.monotonic()
             try:
                 deleted = self.store.cleanup()
                 with self.lock:
@@ -219,18 +194,16 @@ class CameraWorker:
             except Exception:
                 log.exception("background retention failed")
             with self.lock:
-                self.last_cleanup_seconds = time.monotonic() - start
+                self.last_cleanup_seconds = time.monotonic() - begin
             if self.janitor_stop.wait(120):
                 break
 
     def _supervise(self):
-        # _loop finalizes the encoder and releases the camera on exit.
-        # An unexpected exit should not silently disable the NVR forever.
         while self.running:
             try:
                 self._loop()
             except Exception:
-                log.exception("camera supervisor caught unexpected exception")
+                log.exception("camera analyzer failure")
             if self.running:
                 with self.lock:
                     self.loop_restarts += 1
@@ -240,11 +213,23 @@ class CameraWorker:
 
     def status(self):
         with self.lock:
-            return {
+            recent = [t for t in self.process_timestamps
+                      if time.monotonic() - t <= 5]
+            actual_fps = ((len(recent) - 1) / (recent[-1] - recent[0])
+                          if len(recent) > 1 and recent[-1] > recent[0] else 0)
+            costs = sorted(self.process_cost_ms)
+            p95 = costs[int((len(costs)-1)*.95)] if costs else 0
+            active = self._active.status() if self._active else {}
+            pending_depth = sum(r.status()["encoder_queue_depth"] for r in self._pending)
+            state = {
                 "online": self.online, "state": self.state, "error": self.error,
-                "score": self.score, "level": self.activity_level, "recording_clip": self.rec_active,
+                "score": self.score, "level": self.activity_level,
+                "recording_clip": self.rec_active,
                 "last_frame": self.last_frame, "fps_target": self.fps,
+                "actual_analysis_fps": round(actual_fps, 2),
+                "processing_p95_ms": round(p95, 2),
                 "frames_processed": self.frames_processed,
+                "frames_skipped": self.frames_skipped,
                 "worker_alive": bool(self.thread and self.thread.is_alive()),
                 "loop_restarts": self.loop_restarts,
                 "lighting_changes_ignored": self.detector.lighting_events,
@@ -253,246 +238,274 @@ class CameraWorker:
                 "source": "模拟演示画面" if self.demo else self.camera,
                 "last_event_id": self.last_event_id,
                 "activity_seconds": list(self.activity_seconds),
+                "preview_clients": self.preview_viewers,
+                "encoder_queue_depth": active.get("encoder_queue_depth", 0) + pending_depth,
+                "encoder_frames_dropped": self.encoder_drops_total + active.get("encoder_frames_dropped", 0),
+                "encoder_frames_duplicated": self.encoder_duplicates_total + active.get("encoder_frames_duplicated", 0),
+                "encoder_pending_clips": len(self._pending),
+                "encoder_failures": self.encoder_failures,
+                "last_encoder_error": self.last_encoder_error,
+                "storage_online": self.storage_online,
+                "storage_guard_stops": self.storage_guard_stops,
             }
+        state.update(self.grabber.status())
+        return state
+
+    def invalidate_preview(self):
+        with self.condition:
+            self.jpeg = None
+            self.latest_frame = None
+            self.seq += 1
+            self.condition.notify_all()
 
     def snapshot(self) -> bytes | None:
         with self.lock:
-            return self.jpeg
+            frame = self.latest_frame
+        if frame is None:
+            return None
+        # Apply current masks again: newly added privacy zones are never missed
+        # by one-shot snapshots during a live settings update.
+        zones = self.store.settings()["zones"]
+        protected = privacy_redact(frame, zones)
+        ok, jpg = cv2.imencode(".jpg", protected, [cv2.IMWRITE_JPEG_QUALITY, 78])
+        return jpg.tobytes() if ok else None
 
     def frames(self):
         previous = -1
-        while self.running:
+        with self.condition:
+            self.preview_viewers += 1
+        try:
+            while self.running:
+                with self.condition:
+                    self.condition.wait_for(
+                        lambda: self.seq != previous or not self.running, timeout=3)
+                    if not self.running:
+                        return
+                    previous = self.seq
+                    jpg = self.jpeg
+                if jpg:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                           + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+        finally:
             with self.condition:
-                self.condition.wait_for(lambda: self.seq != previous or not self.running, timeout=3)
-                if not self.running:
-                    return
-                previous = self.seq
-                data = self.jpeg
-            if data:
-                yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                       + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
-
-    def _demo_frame(self, t: float):
-        frame = np.empty((self.height, self.width, 3), np.uint8)
-        frame[:] = (23, 28, 32)
-        cv2.rectangle(frame, (32, 62), (600, 322), (40, 48, 57), -1)
-        cv2.rectangle(frame, (52, 88), (210, 260), (55, 67, 78), 2)
-        cv2.rectangle(frame, (410, 90), (554, 245), (65, 76, 84), 2)
-        cv2.putText(frame, "DEMO CAMERA - NOT REAL VIDEO", (110, 34), cv2.FONT_HERSHEY_SIMPLEX, .62, (190, 190, 190), 1, cv2.LINE_AA)
-        phase = t % 18
-        if 5 < phase < 12:
-            px = int(40 + (phase - 5) / 7 * 500)
-            cv2.circle(frame, (px, 191), 29, (160, 180, 220), -1)
-        return frame
+                self.preview_viewers = max(0, self.preview_viewers - 1)
 
     def _letterbox(self, frame):
         h, w = frame.shape[:2]
         scale = min(self.width / w, self.height / h)
-        resized = cv2.resize(frame, (max(1, round(w * scale)), max(1, round(h * scale))))
+        resized = cv2.resize(frame, (max(1, round(w * scale)),
+                                     max(1, round(h * scale))))
         out = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         rh, rw = resized.shape[:2]
         x, y = (self.width - rw) // 2, (self.height - rh) // 2
         out[y:y + rh, x:x + rw] = resized
         return out
 
+    def _storage_ok(self):
+        try:
+            if self.require_mount and not os.path.ismount(self.require_mount):
+                return False
+            return self.store.path.stat().st_dev == self.storage_device
+        except OSError:
+            return False
+
+    def _reap_encoders(self):
+        remaining = []
+        for recorder in self._pending:
+            if recorder.complete.is_set():
+                stat = recorder.status()
+                self.encoder_drops_total += stat["encoder_frames_dropped"]
+                self.encoder_duplicates_total += stat["encoder_frames_duplicated"]
+                if stat["encoder_error"]:
+                    self.encoder_failures += 1
+                    self.last_encoder_error = stat["encoder_error"]
+            else:
+                remaining.append(recorder)
+        self._pending = remaining
+
+    def _finish_active(self):
+        if self._active:
+            self._active.finish()
+            self._pending.append(self._active)
+            self._active = None
+        with self.lock:
+            self.rec_active = False
+
+    def _start_event(self, history, ts, score, zones):
+        if not self.storage_online or len(self._pending) >= 2:
+            return False
+        if not self.store.allow_new_recording():
+            return False
+        event_wall = history[0][0] if history else time.time()
+        ident = uuid.uuid4().hex[:18]
+        day = datetime.fromtimestamp(event_wall).strftime("%Y-%m-%d")
+        name = datetime.fromtimestamp(event_wall).strftime("%H-%M-%S") + f"_{ident[:8]}.mp4"
+        relative = f"recordings/{day}/{name}"
+        thumbnail = f"thumbnails/{day}/{name[:-4]}.jpg"
+        try:
+            self.store.create_event(ident, event_wall, relative, thumbnail)
+            poster = self.store.path / thumbnail
+            poster.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            frame = history[-1][2]
+            if not cv2.imwrite(str(poster), frame,
+                               [cv2.IMWRITE_JPEG_QUALITY, 79]):
+                raise RuntimeError("Cannot write event thumbnail")
+            recorder = AsyncEventRecorder(
+                self.store, ident, self.store.path / relative,
+                self.width, self.height, self.fps)
+            for wall, mono, image in history:
+                recorder.append(image, mono, score)
+            self._active = recorder
+            with self.lock:
+                self.last_event_id = ident
+                self.rec_active = True
+            return True
+        except Exception as exc:
+            log.exception("failed to initiate event")
+            self.store.remove_event(ident)
+            with self.lock:
+                self.error = str(exc)
+            return False
+
+    def _render_preview(self, frame, boxes, state, active):
+        shown = frame.copy()
+        if self.store.settings()["show_boxes"]:
+            for x, y, w, h in boxes:
+                cv2.rectangle(shown, (x, y), (x+w, y+h), (48, 182, 255), 2)
+        cv2.rectangle(shown, (0, self.height - 35),
+                      (self.width, self.height), (19, 25, 35), -1)
+        cv2.putText(shown, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    (13, self.height - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                    .55, (242, 246, 248), 1, cv2.LINE_AA)
+        if active:
+            cv2.putText(shown, "REC", (self.width-80, self.height-12),
+                        cv2.FONT_HERSHEY_SIMPLEX, .55, (58, 63, 234), 1)
+        if state == "motion":
+            cv2.putText(shown, "MOTION", (self.width-185, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, .6, (25, 186, 248), 2)
+        ok, jpg = cv2.imencode(".jpg", shown, [cv2.IMWRITE_JPEG_QUALITY, 76])
+        if ok:
+            with self.condition:
+                self.jpeg = jpg.tobytes()
+                self.seq += 1
+                self.condition.notify_all()
+
     def _loop(self):
-        cap = None
-        encoder = None
-        ev = None
         buffer = deque(maxlen=self.fps * 3)
-        motion_streak = 0
+        last_seq = 0
+        last_reconnect = -1
         last_motion = 0.0
+        motion_streak = 0
         last_preview = 0.0
-        started_at = time.monotonic()
-        next_frame = 0.0
-        open_retry = 0.0
+        last_good_mono = time.monotonic()
+        zone_key = None
+        last_disk_check = 0.0
+        clip_begin = 0.0
         try:
             while self.running:
-                now = time.monotonic()
-                if not self.demo and cap is None:
-                    if now < open_retry:
-                        time.sleep(.3)
-                        continue
-                    source = int(self.camera) if self.camera.isdecimal() else self.camera
-                    network = isinstance(source, str) and source.lower().startswith(
-                        ("rtsp://", "rtsps://", "http://", "https://"))
-                    backend = cv2.CAP_FFMPEG if network else (
-                        cv2.CAP_V4L2 if os.name == "posix" else cv2.CAP_ANY)
-                    cap = cv2.VideoCapture(source, backend)
-                    if not cap.isOpened():
-                        cap.release()
-                        cap = None
-                        open_retry = now + 4
+                tic = time.monotonic()
+                packet = self.grabber.get(last_seq, timeout=.5)
+                self._reap_encoders()
+                if packet is None:
+                    cap = self.grabber.status()
+                    if not cap["camera_online"] or time.monotonic()-last_good_mono > 2:
+                        self._finish_active()
+                        buffer.clear()
                         with self.lock:
-                            self.online, self.state = False, "offline"
-                            self.error = f"无法打开摄像头 {self.camera}，可运行 v4l2-ctl --list-devices"
-                        time.sleep(.3)
-                        continue
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                    cap.set(cv2.CAP_PROP_FPS, self.fps)
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # best-effort for V4L2
-                    with self.lock:
-                        self.error = ""
+                            self.online = False
+                            self.state = "offline"
+                            self.error = cap["camera_error"] or "摄像头画面超时"
+                    continue
+                if packet.seq <= last_seq:
+                    continue
+                if last_seq:
+                    self.frames_skipped += max(0, packet.seq-last_seq-1)
+                last_seq = packet.seq
+                last_good_mono = time.monotonic()
+                reconnects = self.grabber.status()["camera_reconnects"]
+                if reconnects != last_reconnect:
+                    last_reconnect = reconnects
+                    self._finish_active()
                     self.detector = MotionDetector()
-                    next_frame = 0.0
-
-                if next_frame > now:
-                    time.sleep(min(.03, next_frame - now))
-                    continue
-                next_frame = now + 1.0 / self.fps
-                if self.demo:
-                    frame = self._demo_frame(now - started_at)
-                    ok = True
+                    buffer.clear()
+                    motion_streak = 0
+                cfg = self.store.settings()
+                new_zone_key = json.dumps(cfg["zones"], sort_keys=True)
+                if zone_key is not None and new_zone_key != zone_key:
+                    # A privacy rule changed: split the clip and discard *all*
+                    # preroll cached under the previous redaction policy.
+                    self._finish_active()
+                    buffer.clear()
+                    motion_streak = 0
+                    self.detector = MotionDetector()
+                    self.invalidate_preview()
+                zone_key = new_zone_key
+                frame = privacy_redact(self._letterbox(packet.frame), cfg["zones"])
+                score, boxes, motion = self.detector.detect(
+                    frame, cfg["sensitivity"], cfg["zones"])
+                if packet.mono_time-last_disk_check > 5:
+                    last_disk_check = packet.mono_time
+                    disk_ok = self._storage_ok()
+                    if not disk_ok and self._active:
+                        self.storage_guard_stops += 1
+                        self._finish_active()
+                    self.storage_online = disk_ok
+                if motion:
+                    motion_streak += 1
+                    last_motion = packet.mono_time
                 else:
-                    ok, frame = cap.read()
-                if not ok or frame is None:
-                    if encoder and ev:
-                        self._close_encoder(encoder, ev)
-                        encoder, ev = None, None
-                    if cap:
-                        cap.release()
-                        cap = None
-                    with self.lock:
-                        self.online, self.state, self.error = False, "offline", "摄像头读取失败，正在重连"
-                    time.sleep(1)
-                    continue
-                # Preserve source aspect ratio instead of squashing 4:3 UVC video.
-                frame = self._letterbox(frame)
-                self.frames_processed += 1
-                score, boxes, motion = self.detector.detect(frame, self.store.settings()["sensitivity"])
+                    motion_streak = 0
+                if (self._active is None and motion_streak >= cfg["min_motion_frames"]
+                        and cfg["record_enabled"] and self.storage_online):
+                    if self._start_event(
+                            buffer, packet.mono_time, score, cfg["zones"]):
+                        clip_begin = buffer[0][1] if buffer else packet.mono_time
+                if self._active:
+                    self._active.append(frame, packet.mono_time, score)
+                    if (not cfg["record_enabled"] or
+                            packet.mono_time-last_motion >= cfg["post_roll_seconds"] or
+                            packet.mono_time-clip_begin >= cfg["max_clip_seconds"]):
+                        self._finish_active()
+                        motion_streak = 0
+                buffer.append((packet.wall_time, packet.mono_time, frame))
+                new_state = ("calibrating" if self.detector.samples <= self.detector.warmup
+                             else ("motion" if motion else "idle"))
                 with self.lock:
                     self.score = score
                     self.boxes = boxes
                     self.activity_level = level(score)
-                    second = int(time.time())
-                    if self.activity_seconds and self.activity_seconds[-1][0] == second:
-                        previous = self.activity_seconds[-1][1]
-                        ranks = {"idle": 0, "low": 1, "medium": 2, "high": 3}
-                        self.activity_seconds[-1] = (second, max(previous, self.activity_level, key=lambda x: ranks[x]))
+                    sec = int(packet.wall_time)
+                    ranks = {"idle":0,"low":1,"medium":2,"high":3}
+                    if self.activity_seconds and self.activity_seconds[-1][0] == sec:
+                        prior = self.activity_seconds[-1][1]
+                        self.activity_seconds[-1] = (
+                            sec, max(prior, self.activity_level, key=lambda x: ranks[x]))
                     else:
-                        self.activity_seconds.append((second, self.activity_level))
+                        self.activity_seconds.append((sec, self.activity_level))
+                    self.latest_frame = frame
                     self.online = True
-                    self.state = "calibrating" if self.detector.samples <= self.detector.warmup else ("motion" if motion else "idle")
-                    self.last_frame = time.time()
+                    self.state = new_state
+                    self.last_frame = packet.wall_time
                     self.error = ""
-
-                cfg = self.store.settings()
-                can_record = cfg["record_enabled"]
-                if motion:
-                    motion_streak += 1
-                    last_motion = now
-                else:
-                    motion_streak = 0
-                was_active = encoder is not None
-                if encoder is None and motion_streak >= cfg["min_motion_frames"] and can_record:
-                    # Camera clips only start if there's enough free space and room in the quota.
-                    if self.store.allow_new_recording() and (
-                            self.require_mount is None or os.path.ismount(self.require_mount)):
-                        event_ts = buffer[0][0] if buffer else time.time()
-                        event_id = uuid.uuid4().hex[:18]
-                        day = datetime.fromtimestamp(event_ts).strftime("%Y-%m-%d")
-                        name = datetime.fromtimestamp(event_ts).strftime("%H-%M-%S") + f"_{event_id[:8]}.mp4"
-                        rel = f"recordings/{day}/{name}"
-                        poster = f"thumbnails/{day}/{name[:-4]}.jpg"
-                        try:
-                            encoder = VideoEncoder(self.store.path / rel, self.width, self.height, self.fps)
-                            for _, old_frame in buffer:
-                                encoder.append(old_frame)
-                            self.store.create_event(event_id, event_ts, rel, poster)
-                            ev = {"id": event_id, "start": event_ts, "score": score,
-                                  "thumb": poster, "last_update": now}
-                            thumb_frame = buffer[-1][1] if buffer else frame
-                            (self.store.path / poster).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                            cv2.imwrite(str(self.store.path / poster), thumb_frame, [cv2.IMWRITE_JPEG_QUALITY, 79])
-                            with self.lock:
-                                self.last_event_id = event_id
-                                self.rec_active = True
-                        except Exception as ex:
-                            log.exception("start recording failed")
-                            with self.lock:
-                                self.error = str(ex)
-                            if encoder:
-                                try:
-                                    encoder.close()
-                                except Exception:
-                                    pass
-                                encoder.path.unlink(missing_ok=True)
-                            self.store.remove_event(event_id)
-                            (self.store.path / poster).unlink(missing_ok=True)
-                            encoder, ev = None, None
-                if encoder:
-                    try:
-                        encoder.append(frame)
-                        ev["score"] = max(score, ev["score"])
-                        if now - ev["last_update"] >= 1.5:
-                            self.store.progress_event(ev["id"], encoder.frame_count / self.fps, ev["score"])
-                            ev["last_update"] = now
-                    except Exception as ex:
-                        log.exception("append recording")
-                        with self.lock:
-                            self.error = str(ex)
-                        # attempt finalize; file may not be playable
-                        self._close_encoder(encoder, ev)
-                        encoder, ev = None, None
-                    else:
-                        if (not can_record or now - last_motion >= cfg["post_roll_seconds"]
-                                or encoder.frame_count / self.fps >= cfg["max_clip_seconds"]):
-                            self._close_encoder(encoder, ev)
-                            encoder, ev = None, None
-                            if now - last_motion < cfg["post_roll_seconds"]:
-                                motion_streak = 0
-                buffer.append((time.time(), frame.copy()))
-                if now - last_preview > 0.38:
-                    shown = frame.copy()
+                    self.frames_processed += 1
+                if packet.mono_time-last_preview > .38:
                     with self.lock:
-                        state = self.state
-                        active = self.rec_active
-                    if cfg["show_boxes"]:
-                        for x, y, ww, hh in boxes:
-                            cv2.rectangle(shown, (x, y), (x + ww, y + hh), (48, 182, 255), 2)
-                    caption = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
-                    cv2.rectangle(shown, (0, self.height - 35), (self.width, self.height), (19, 25, 35), -1)
-                    cv2.putText(shown, caption, (13, self.height - 12), cv2.FONT_HERSHEY_SIMPLEX, .60, (242, 246, 248), 1, cv2.LINE_AA)
-                    if active:
-                        cv2.circle(shown, (self.width - 120, self.height - 18), 6, (58, 63, 234), -1)
-                        cv2.putText(shown, "REC", (self.width - 106, self.height - 12), cv2.FONT_HERSHEY_SIMPLEX, .58, (235, 235, 247), 1)
-                    if state == "motion":
-                        cv2.putText(shown, "MOTION", (self.width - 195, 25), cv2.FONT_HERSHEY_SIMPLEX, .65, (25, 186, 248), 2)
-                    ok_jpg, img_jpg = cv2.imencode(".jpg", shown, [cv2.IMWRITE_JPEG_QUALITY, 76])
-                    if ok_jpg:
-                        with self.condition:
-                            self.jpeg = img_jpg.tobytes()
-                            self.seq += 1
-                            self.condition.notify_all()
-                    last_preview = now
-        except Exception as exc:
-            log.exception("camera worker unexpectedly stopped")
-            with self.lock:
-                self.error = f"采集线程异常停止：{exc}"
+                        viewers = self.preview_viewers
+                    if viewers:
+                        self._render_preview(frame, boxes, new_state, self._active is not None)
+                    last_preview = packet.mono_time
+                with self.lock:
+                    self.process_timestamps.append(time.monotonic())
+                    self.process_cost_ms.append((time.monotonic()-tic)*1000)
         finally:
-            if encoder and ev:
-                self._close_encoder(encoder, ev)
-            if cap:
-                cap.release()
+            self._finish_active()
+            # Shut down writers gracefully, never run orphan FFmpeg children after
+            # a worker restart. Active stream remains done=0 if it times out and
+            # will be inspected by the startup reconciler.
+            for pending in self._pending:
+                pending.join(timeout=12)
+            self._reap_encoders()
             with self.lock:
-                self.online, self.rec_active, self.state = False, False, "offline"
-
-    def _close_encoder(self, encoder: VideoEncoder, ev: dict):
-        try:
-            duration = encoder.close()
-            path = encoder.path
-            if duration >= .25 and path.is_file() and path.stat().st_size > 1000:
-                self.store.finish_event(ev["id"], duration, ev["score"], path.stat().st_size)
-            else:
-                self.store.remove_event(ev["id"])
-                path.unlink(missing_ok=True)
-        except Exception as ex:
-            self.store.remove_event(ev["id"])
-            encoder.path.unlink(missing_ok=True)
-            log.exception("video finalize failed")
-            with self.lock:
-                self.error = f"录制文件完成失败: {ex}"
-        finally:
-            with self.lock:
+                self.online = False
                 self.rec_active = False
+                self.state = "offline"
