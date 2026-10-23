@@ -278,7 +278,7 @@ class Store:
         folder = self.path / "recordings"
         if folder.is_dir():
             for file in folder.glob("*/*.mp4"):
-                if not re.fullmatch(r"\\d{2}-\\d{2}-\\d{2}_[0-9a-f]{8}\\.mp4", file.name):
+                if not re.fullmatch(r"\d{2}-\d{2}-\d{2}_[0-9a-f]{8}\.mp4", file.name):
                     continue
                 if file.relative_to(self.path).as_posix() not in indexed:
                     # Log, don't destroy footage with unknown provenance.
