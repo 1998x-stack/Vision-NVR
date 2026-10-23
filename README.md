@@ -1,5 +1,8 @@
 # Vision NVR 1.0 · 本地智能摄像头录像系统
 
+> **跨 Ubuntu 便携部署版本**：新增 `.env.example`、`scripts/common.sh`、venv/Conda 双模式以及 `docs/DEPLOY_UBUNTU.md`。**完整、最新的安装方法以 [Ubuntu 部署与配置指南](docs/DEPLOY_UBUNTU.md) 为准。** 旧版 README 中固定 Miniconda 路径和 `/mnt/sda4` 的操作示例仅适用于原始机器，不是所有 Ubuntu 的默认要求。
+
+
 > 专为 Ubuntu 20.04 + 老款 Intel i7 + USB 笔记本摄像头设计。无 API Key、无云服务，所有录像都保存在自己的机器。**仅在有权使用摄像头、被拍摄者知情的环境中开启录制。** 默认仅允许本机访问，用户每次启动服务都必须手动点击“开启智能录像”。
 
 ## 一、功能

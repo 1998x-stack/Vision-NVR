@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -80,19 +81,20 @@ class VideoEncoder:
             raise RuntimeError("找不到 FFmpeg。请先激活含 ffmpeg 的 Conda 环境。")
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._stderr_log = tempfile.TemporaryFile(mode="w+b")
         self.proc = subprocess.Popen([
             binary, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pixel_format", "bgr24", "-video_size", f"{width}x{height}",
             "-framerate", str(fps), "-i", "pipe:0", "-an", "-c:v", "libx264",
             "-preset", "veryfast", "-crf", "29", "-pix_fmt", "yuv420p",
             "-g", str(fps * 2), "-movflags", "+faststart", "-f", "mp4", str(path)
-        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._stderr_log)
         self.frame_count = 0
         self.fps = fps
 
     def append(self, frame: np.ndarray):
         if self.proc.poll() is not None:
-            msg = self.proc.stderr.read().decode("utf-8", errors="replace")[-700:]
+            msg = self._error_tail()
             raise RuntimeError(f"FFmpeg 录制中断：{msg}")
         try:
             self.proc.stdin.write(frame.tobytes())
@@ -100,31 +102,43 @@ class VideoEncoder:
         except (BrokenPipeError, OSError) as exc:
             raise RuntimeError("FFmpeg 无法写入视频；检查磁盘空间与编码支持") from exc
 
+    def _error_tail(self):
+        self._stderr_log.seek(0, os.SEEK_END)
+        end = self._stderr_log.tell()
+        self._stderr_log.seek(max(0, end - 4096))
+        return self._stderr_log.read().decode("utf-8", errors="replace")[-700:]
+
     def close(self):
-        if self.proc.stdin and not self.proc.stdin.closed:
-            self.proc.stdin.close()
         try:
-            msg = self.proc.stderr.read().decode("utf-8", errors="replace")[-700:]
-            self.proc.stderr.close()
-            rc = self.proc.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
-            raise RuntimeError("FFmpeg 结束录制超时")
-        if self.proc.stderr:
-            self.proc.stderr.close()
-        if rc != 0:
-            raise RuntimeError(f"FFmpeg 编码错误：{msg}")
-        return self.frame_count / self.fps
+            if self.proc.stdin and not self.proc.stdin.closed:
+                try:
+                    self.proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+            try:
+                rc = self.proc.wait(timeout=20)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("FFmpeg 结束录制超时") from exc
+            message = self._error_tail()
+            if rc != 0:
+                raise RuntimeError(f"FFmpeg 编码错误（exit {rc}）：{message}")
+            return self.frame_count / self.fps
+        finally:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait()
+            self._stderr_log.close()
 
 
 class CameraWorker:
-    def __init__(self, store, *, camera: str = "/dev/video0", demo: bool = False, fps: int = 8):
+    def __init__(self, store, *, camera: str = "/dev/video0", demo: bool = False, fps: int = 8,
+                 width: int = 640, height: int = 360, require_mount: Path | None = None):
         self.store = store
         self.camera = camera
         self.demo = demo
         self.fps = fps
-        self.width, self.height = 640, 360
+        self.width, self.height = width, height
+        self.require_mount = require_mount
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.running = False
@@ -256,6 +270,9 @@ class CameraWorker:
                 else:
                     ok, frame = cap.read()
                 if not ok or frame is None:
+                    if encoder and ev:
+                        self._close_encoder(encoder, ev)
+                        encoder, ev = None, None
                     if cap:
                         cap.release()
                         cap = None
@@ -292,7 +309,8 @@ class CameraWorker:
                 was_active = encoder is not None
                 if encoder is None and motion_streak >= cfg["min_motion_frames"] and can_record:
                     # Camera clips only start if there's enough free space and room in the quota.
-                    if self.store.allow_new_recording():
+                    if self.store.allow_new_recording() and (
+                            self.require_mount is None or os.path.ismount(self.require_mount)):
                         event_ts = buffer[0][0] if buffer else time.time()
                         event_id = uuid.uuid4().hex[:18]
                         day = datetime.fromtimestamp(event_ts).strftime("%Y-%m-%d")

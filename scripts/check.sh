@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set +e
-echo '===== 操作系统 ====='
-lsb_release -d 2>/dev/null; uname -r
-echo '===== 摄像头设备 ====='
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+PYTHON="$(resolve_python)" || exit 1
+export PATH="$(dirname "$PYTHON"):$PATH"
+echo '===== OS / Python ====='
+uname -a
+"$PYTHON" --version
+"$PYTHON" -c 'import cv2,fastapi; print(cv2.__version__, fastapi.__version__)'
+echo '===== Camera ====='
 ls -l /dev/video* 2>/dev/null
 command -v v4l2-ctl >/dev/null && v4l2-ctl --list-devices
-echo '===== 摄像头访问权限 ====='
-id -nG
 echo '===== FFmpeg H.264 ====='
-ffmpeg -hide_banner -encoders 2>/dev/null | grep libx264 | head -2
-echo '===== 运行环境 ====='
-"$HOME/miniconda3/envs/vision-nvr/bin/python" -c 'import cv2,fastapi; print(cv2.__version__,fastapi.__version__)'
-echo '===== 服务 ====='
-systemctl --user is-active vision-nvr.service
-echo '===== 网页连通 ====='
-curl --max-time 3 -fsS http://127.0.0.1:7866/healthz; echo
+ffmpeg -hide_banner -encoders 2>/dev/null | grep libx264 | head -1
+echo '===== Recording root ====='
+"$PYTHON" - <<'PY'
+from app.config import config
+from pathlib import Path
+import os
+c=config()
+print('root=',c.data_dir,'camera=',c.camera,'fps=',c.fps,'size=',(c.width,c.height))
+if c.require_mount: print('required mount=',c.require_mount,'mounted=',os.path.ismount(c.require_mount))
+PY

@@ -13,14 +13,12 @@ from pydantic import BaseModel
 from .engine import CameraWorker
 from .store import Store
 
+from .config import config
 PROJECT = Path(__file__).resolve().parent
-DATA = Path(os.getenv("NVR_DATA_DIR", "~/VisionNVR")).expanduser().resolve()
-# Prevent silent SSD writes when the intended HDD archive is not mounted.
-if DATA == Path("/mnt/sda4") or Path("/mnt/sda4") in DATA.parents:
-    if not os.path.ismount("/mnt/sda4"):
-        raise RuntimeError("录像目标是 /mnt/sda4，但 HDD 未挂载。请先检查 findmnt /mnt/sda4，避免误写入 SSD。")
-store = Store(DATA)
-worker = CameraWorker(store, camera=os.getenv("NVR_CAMERA", "/dev/video0"), demo=os.getenv("NVR_DEMO", "0") == "1")
+CONFIG = config()
+store = Store(CONFIG.data_dir)
+worker = CameraWorker(store, camera=CONFIG.camera, demo=CONFIG.demo, fps=CONFIG.fps,
+                      width=CONFIG.width, height=CONFIG.height, require_mount=CONFIG.require_mount)
 
 
 @asynccontextmanager
