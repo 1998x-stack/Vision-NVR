@@ -1,4 +1,6 @@
-# Vision NVR 1.0 · 本地智能摄像头录像系统
+# Vision NVR 2.0 · 本地智能摄像头事件录像系统
+
+> **2.0 稳定性与隐私修复：** 新增 Host 白名单防 DNS Rebinding、采集线程监督恢复、独立定期清理、批量配额回收、未完成录像启动恢复、光照变化抑制、私有存储权限、MP4 分片、自动化安全回归测试。详见 [v2.0 升级、兼容性与验证指南](docs/V2_MIGRATION.md)。录像仍须每次启动后手动开启，仍默认仅供本机访问。**目前还未完成采集/FFmpeg 完整异步解耦、视频 ROI 与隐私遮罩，也未进行目标物理摄像头压力测试。**
 
 > **跨 Ubuntu 便携部署版本**：新增 `.env.example`、`scripts/common.sh`、venv/Conda 双模式以及 `docs/DEPLOY_UBUNTU.md`。**完整、最新的安装方法以 [Ubuntu 部署与配置指南](docs/DEPLOY_UBUNTU.md) 为准。** 旧版 README 中固定 Miniconda 路径和 `/mnt/sda4` 的操作示例仅适用于原始机器，不是所有 Ubuntu 的默认要求。
 
