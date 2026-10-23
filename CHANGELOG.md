@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.0 — decoupled recording and server-side privacy zones
+
+- Dedicated `FrameGrabber` grabs the latest camera frame without waiting for detection or compression; status reports captured, overwritten and skipped samples.
+- Separate `AsyncEventRecorder` runs FFmpeg stdin on a dedicated thread with a bounded queue; overload drops old samples, adds short CFR compensating frames, and reports queue depth/drops/duplication/failures.
+- Nonblocking FFmpeg pipe writes have a timeout to bound stalls; short network/camera outages split events and reset motion history.
+- New include/exclude/privacy polygons (up to 8 of each) with coordinate validation, browser drawing and persistent settings. Privacy is redacted in pixel buffers **before** thumbnails/preroll/encoding; zone edits terminate active clips and invalidate stale previews.
+- New pipeline metrics (capture and analysis fps, P95 latency, dropped/duplicated frames, background janitor stats, disk state), with a live UI telemetry panel.
+- Frontend CSS and JS extracted; unsafe inline event handlers removed. Same-origin CSP and explicit static-asset routing added.
+- Broader synthetic tests and demo end-to-end recording/seek regression on Ubuntu 22.04 / 24.04.
+- See `docs/V3_ARCHITECTURE.md`. **Not yet** validated on actual UVC/RTSP camera hardware for 24h use.
+
+
 ## 2.0.0 — reliability, privacy and verification
 
 - **Security:** explicit Host allowlist on all routes (DNS rebinding), private directory and file permissions even outside the launcher.
