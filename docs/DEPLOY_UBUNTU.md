@@ -85,6 +85,8 @@ systemctl --user restart vision-nvr.service
 systemctl --user disable --now vision-nvr.service
 ```
 
+用户服务会在安装时记录检测到的 Python 完整路径，即使 systemd 不加载交互式 Conda 的 PATH 也能启动；如果移动/删除 Python 环境，重新运行 `bash scripts/install-user-service.sh`。
+
 默认行为：用户登录 Ubuntu 后启动网页后端，仍需手动开启录制。不要将用户服务误认为无人登录也能自动录像的 24 小时 NVR。对于长时间运行，建议先测试摄像头断线恢复、硬盘意外拔出、系统休眠和磁盘配额。若真的需要无人登录运行，应由管理员制定独立系统服务、录制同意及权限策略，而不是直接无认证地开放网络端口。
 
 ## 5. 局域网/远程访问
