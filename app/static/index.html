@@ -10,6 +10,14 @@
 @media(max-width:800px){.shell{grid-template-columns:1fr}.sidebar{height:auto;position:static;border-right:0;border-bottom:1px solid var(--line);padding:14px 18px;gap:12px}.nav{display:flex;gap:4px}.nav button{padding:10px;justify-content:center}.nav button span:last-child{display:none}.side-bottom{display:none}.main{padding:22px 15px 50px}.stats{grid-template-columns:1fr 1fr}.archive-grid{grid-template-columns:1fr}.days-list{display:flex;gap:7px;overflow:auto;align-items:center}.days-list h3{display:none}.daybtn{white-space:nowrap;width:auto}.settings-grid{grid-template-columns:1fr}.event-row{grid-template-columns:88px minmax(0,1fr)}.event-row .actions{grid-column:2;justify-content:flex-start}.thumb{width:88px;height:62px}}
 @media(max-width:520px){.panel-head{padding:15px}.viewer{margin:0 12px 12px}.stat{padding:13px}.stat .v{font-size:21px}.clock{display:none}.sidepanel{grid-template-columns:1fr}.folder-grid{grid-template-columns:1fr}.clip-card{max-width:100%}}
 .livehistory{margin:-5px 18px 17px;padding:10px 12px;border:1px solid #293e53;border-radius:10px;background:#111b2b}.livemeta{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10px;color:#91a9bf;margin-bottom:8px}.livebars{display:flex;gap:1px;height:22px;overflow:hidden}.livebars span{flex:1;min-width:1px;border-radius:1px;background:#29394b}.livebars span.low{background:#7fe6ce}.livebars span.medium{background:#ffd17d}.livebars span.high{background:#ff7585}.livebars+.livemeta{margin:6px 0 0}
+
+/* v3 local polygon editor; no remote scripts or external image processing */
+.zone-canvas{position:absolute;inset:0;width:100%;height:100%;z-index:4;pointer-events:none}
+.zone-canvas.editing{pointer-events:auto;cursor:crosshair;touch-action:none}
+.zone-toolbar{margin:0 18px 15px;padding:11px 13px;display:flex;align-items:center;gap:9px;flex-wrap:wrap;border:1px solid #365069;border-radius:10px;background:#142235}
+.zone-toolbar select{background:#1c2c43;color:#eef4ff;border:1px solid #42607c;border-radius:6px;padding:8px}
+.zone-hint{padding:0 18px 15px;font-size:12px;color:#9db2c9;line-height:1.7}
+.metrics-list{font-size:12px;line-height:1.85;font-variant-numeric:tabular-nums;color:#b4c9e1;white-space:pre-line}
 </style>
 </head>
 <body>
@@ -23,7 +31,7 @@
  <header class="topline"><div><div class="eyebrow">PRIVATE VIDEO CONTROL CENTER</div><h1 id="page-title">实时监控中心</h1><div class="subtitle" id="page-subtitle">仅在你明确开启录制时保存事件视频；静止时只在内存中进行检测。</div></div><div class="clock"><time id="clock">--:--:--</time><small id="date-label">设备本地时间</small></div></header>
  <section class="stats"><div class="stat"><span class="k">摄像头连接</span><strong class="v" id="stat-camera">—</strong><small id="stat-source">检查设备中</small></div><div class="stat"><span class="k">当前监测状态</span><strong class="v" id="stat-motion">—</strong><small id="stat-score">变化强度 0.00%</small></div><div class="stat"><span class="k">已归档事件</span><strong class="v" id="stat-events">0</strong><small>仅包含已完成录像</small></div><div class="stat"><span class="k">录像占用空间</span><strong class="v" id="stat-storage">—</strong><small id="stat-disk">磁盘信息加载中</small></div></section>
  <div id="page-live">
-  <div class="live-row"><section class="panel"><div class="panel-head"><div><div class="panel-title">摄像头 · LIVE 01</div><div class="panel-desc">即时预览 · 动态区域框选 · 本地时间水印</div></div><div class="toolrow"><span class="chip"><span class="dot" id="live-dot"></span><span id="live-label">连接中</span></span><button class="btn primary" id="record-toggle" onclick="toggleRecord()">开启智能录像</button></div></div><div class="viewer"><img id="stream" src="/api/live.mjpg" alt="本机摄像头实时视频预览"><div class="preview-message" id="offline-overlay"><span class="camicon">◉</span><strong id="overlay-main">连接摄像头中</strong><span id="overlay-help">首次启动时，程序需要数秒初始化运动背景。</span></div><div class="overlay-upper"><span class="chip">CAM 01</span><span class="chip" id="motion-chip">○ 静止</span></div></div><div class="livehistory"><div class="livemeta"><span>最近 3 分钟 · 运动变化</span><span>只显示活动强度，不识别人物身份</span></div><div class="livebars" id="livebars" aria-label="实时运动活动历史"></div><div class="livemeta muted"><span>3 分钟前</span><span>现在</span></div></div></section><aside class="sidepanel"><div class="panel motion-meter"><div style="display:flex;justify-content:space-between;align-items:center"><h3>实时运动检测</h3><span class="tag" id="motion-level">STANDBY</span></div><div class="motion-bar"><div class="motion-fill" id="motion-fill"></div></div><div style="display:flex;justify-content:space-between"><strong id="motion-pct" style="font-size:25px;font-variant-numeric:tabular-nums">0.00%</strong><span class="tiny muted">画面有效变化比例</span></div><p class="hint" id="motion-hint">正在建立背景模型。画面静止时不会生成录像文件。</p></div><div class="panel keybox"><h3 style="margin:0 0 10px;font-size:14px">活动等级与颜色</h3><div class="entry"><span class="key" style="background:#63798e"></span><span class="label">静止 / 无有效变化</span><b>不录制</b></div><div class="entry"><span class="key" style="background:var(--accent)"></span><span class="label">轻微运动</span><b>绿色</b></div><div class="entry"><span class="key" style="background:var(--yellow)"></span><span class="label">一般运动</span><b>黄色</b></div><div class="entry"><span class="key" style="background:var(--red)"></span><span class="label">显著运动</span><b>红色</b></div><p class="tiny muted" style="line-height:1.7">颜色不代表确认存在人员，无法区分人、动物、窗帘或光影。</p></div></aside></div>
+  <div class="live-row"><section class="panel"><div class="panel-head"><div><div class="panel-title">摄像头 · LIVE 01</div><div class="panel-desc">即时预览 · 动态区域框选 · 本地时间水印</div></div><div class="toolrow"><span class="chip"><span class="dot" id="live-dot"></span><span id="live-label">连接中</span></span><button class="btn ghost" id="zones-toggle" onclick="toggleZones()">编辑监测区域</button><button class="btn primary" id="record-toggle" onclick="toggleRecord()">开启智能录像</button></div></div><div class="viewer"><img id="stream" src="/api/live.mjpg" alt="本机摄像头实时视频预览"><canvas id="zone-canvas" class="zone-canvas" aria-label="多边形监测区域画布"></canvas><div class="preview-message" id="offline-overlay"><span class="camicon">◉</span><strong id="overlay-main">连接摄像头中</strong><span id="overlay-help">首次启动时，程序需要数秒初始化运动背景。</span></div><div class="overlay-upper"><span class="chip">CAM 01</span><span class="chip" id="motion-chip">○ 静止</span></div></div><div id="zone-tools" class="zone-toolbar hidden"><label for="zone-type">绘制类型</label><select id="zone-type"><option value="include">蓝色：只检测内部</option><option value="exclude">黄色：忽略运动</option><option value="privacy">黑色：录像永久遮挡</option></select><button class="btn small ghost" onclick="undoZone()">撤销一点/区域</button><button class="btn small ghost" onclick="clearZoneType()">清空当前类型</button><button class="btn small primary" onclick="saveZones()">保存并应用</button><button class="btn small ghost" onclick="cancelZones()">取消</button></div><div id="zone-hint" class="zone-hint hidden">在画面中依次点击至少 3 个顶点，双击闭合；每种类型最多 8 个多边形。隐私遮挡会在后端写入录像前执行；修改时当前录像自动切段、清空旧预录。<b>已有视频不会追溯遮挡。</b></div><div class="livehistory"><div class="livemeta"><span>最近 3 分钟 · 运动变化</span><span>只显示活动强度，不识别人物身份</span></div><div class="livebars" id="livebars" aria-label="实时运动活动历史"></div><div class="livemeta muted"><span>3 分钟前</span><span>现在</span></div></div></section><aside class="sidepanel"><div class="panel motion-meter"><div style="display:flex;justify-content:space-between;align-items:center"><h3>实时运动检测</h3><span class="tag" id="motion-level">STANDBY</span></div><div class="motion-bar"><div class="motion-fill" id="motion-fill"></div></div><div style="display:flex;justify-content:space-between"><strong id="motion-pct" style="font-size:25px;font-variant-numeric:tabular-nums">0.00%</strong><span class="tiny muted">画面有效变化比例</span></div><p class="hint" id="motion-hint">正在建立背景模型。画面静止时不会生成录像文件。</p></div><div class="panel" style="padding:18px"><h3 style="margin:0 0 9px;font-size:14px">运行指标 · Pipeline</h3><div class="metrics-list" id="pipeline-metrics">等待采集指标...</div></div><div class="panel keybox"><h3 style="margin:0 0 10px;font-size:14px">活动等级与颜色</h3><div class="entry"><span class="key" style="background:#63798e"></span><span class="label">静止 / 无有效变化</span><b>不录制</b></div><div class="entry"><span class="key" style="background:var(--accent)"></span><span class="label">轻微运动</span><b>绿色</b></div><div class="entry"><span class="key" style="background:var(--yellow)"></span><span class="label">一般运动</span><b>黄色</b></div><div class="entry"><span class="key" style="background:var(--red)"></span><span class="label">显著运动</span><b>红色</b></div><p class="tiny muted" style="line-height:1.7">颜色不代表确认存在人员，无法区分人、动物、窗帘或光影。</p></div></aside></div>
   <section class="panel timeline"><div class="timelabel"><div><h3>今日活动时间轴</h3><div class="panel-desc">彩色片段可点击回看；灰色区域没有保存录像</div></div><span class="tiny muted" id="timeline-count">0 个事件</span></div><div class="timelinebar" id="timelinebar" aria-label="当日运动事件时间轴"></div><div class="ticks"><span>00:00</span><span>04:00</span><span>08:00</span><span>12:00</span><span>16:00</span><span>20:00</span><span>24:00</span></div></section>
   <div class="section-head"><div><h2>最新录像</h2><div class="desc">按发生时间排序的事件片段</div></div><button class="btn ghost" onclick="switchPage('archive')">进入完整资料库 →</button></div><div class="activity-list" id="recent-list"><div class="empty">等待首次运动录像事件...</div></div>
  </div>
@@ -38,6 +46,7 @@
 <script>
 const $=id=>document.getElementById(id);
 let currentPage='live',daySelected=localDate(),settings={},daysCache=[],statusCache=null,toastTimer=null;
+let zonesEditing=false,zoneDraft=null,zonePoints=[],lastZoneClick=0;
 function localDate(d=new Date()){let y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),v=String(d.getDate()).padStart(2,'0');return `${y}-${m}-${v}`}
 const localTime=(s,seconds=false)=>new Date(s*1000).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit',...(seconds?{second:'2-digit'}:{})});
 const fmtSize=n=>n>=1024**3?(n/1024**3).toFixed(2)+' GB':n>=1024**2?(n/1024**2).toFixed(1)+' MB':Math.ceil(n/1024)+' KB';
@@ -50,10 +59,82 @@ async function send(url,method='POST',body){let r=await fetch(url,{method,header
 function renderLiveBars(data){const now=Math.floor(new Date(statusCache?.server_time||Date.now()).getTime()/1000),values=new Map((data||[]).map(v=>[v[0],v[1]]));let html='';for(let i=179;i>=0;i--){const sec=now-i,lev=values.get(sec)||'idle';html+=`<span class="${lev}" title="${localTime(sec,true)} · ${levelInfo[lev]?.[0]||'静止'}"></span>`;}$('livebars').innerHTML=html}
 function switchPage(page){currentPage=page;['live','archive','settings'].forEach(p=>{$('page-'+p).classList.toggle('hidden',p!==page);$('nav-'+p).classList.toggle('active',p===page)});let titles={live:['实时监控中心','查看实时画面，按运动事件节省录像空间。'],archive:['录像资料库','按日期筛选、预览、下载与保护事件录像。'],settings:['录制与存储设置','自定义算法灵敏度、自动清理与磁盘配额。']};$('page-title').textContent=titles[page][0];$('page-subtitle').textContent=titles[page][1];if(page==='archive')loadArchive();if(page==='settings'&&statusCache)fillSettings(settings)}
 function refreshClock(){let d=new Date();$('clock').textContent=d.toLocaleTimeString('zh-CN',{hour12:false});$('date-label').textContent=d.toLocaleDateString('zh-CN',{year:'numeric',month:'long',day:'numeric',weekday:'long'})}setInterval(refreshClock,1000);refreshClock();
-async function poll(){try{let s=await getJSON('/api/status');statusCache=s;settings=s.settings;let c=s.camera,online=c.online&&(new Date(s.server_time).getTime()/1000-c.last_frame)<7;renderLiveBars(c.activity_seconds);$('stat-camera').textContent=online?'已连接':'未连接';$('stat-camera').style.color=online?'var(--accent)':'var(--red)';$('stat-source').textContent=c.source;$('stat-motion').textContent=c.state==='calibrating'?'校准中':c.state==='motion'?'活动中':'静止待机';$('stat-motion').style.color=c.state==='motion'?'var(--yellow)':'var(--white)';$('stat-score').textContent=`变化强度 ${Number(c.score).toFixed(2)}%`;$('stat-events').textContent=s.events;$('stat-storage').textContent=fmtSize(s.storage.used);$('stat-disk').textContent=`可用 ${fmtSize(s.storage.free)} · 上限 ${fmtSize(s.storage.max_bytes)}`;
+async function poll(){try{let s=await getJSON('/api/status');statusCache=s;settings=s.settings;let c=s.camera,online=c.online&&(new Date(s.server_time).getTime()/1000-c.last_frame)<7;$('pipeline-metrics').textContent=`采集 ${c.capture_fps||0} fps / 分析 ${c.actual_analysis_fps||0} fps
+处理 P95 ${c.processing_p95_ms||0} ms
+相机获取 ${c.frames_captured||0} 帧 · 覆盖丢弃 ${c.frames_overwritten||0}
+分析跳过 ${c.frames_skipped||0} 帧
+编码等待 ${c.encoder_queue_depth||0} · 丢弃 ${c.encoder_frames_dropped||0}
+CFR 补帧 ${c.encoder_frames_duplicated||0} · 编码失败 ${c.encoder_failures||0}
+后台清理 ${c.last_cleanup_seconds||0} s · 设备 ${c.storage_online?'正常':'离线'}`;
+renderLiveBars(c.activity_seconds);$('stat-camera').textContent=online?'已连接':'未连接';$('stat-camera').style.color=online?'var(--accent)':'var(--red)';$('stat-source').textContent=c.source;$('stat-motion').textContent=c.state==='calibrating'?'校准中':c.state==='motion'?'活动中':'静止待机';$('stat-motion').style.color=c.state==='motion'?'var(--yellow)':'var(--white)';$('stat-score').textContent=`变化强度 ${Number(c.score).toFixed(2)}%`;$('stat-events').textContent=s.events;$('stat-storage').textContent=fmtSize(s.storage.used);$('stat-disk').textContent=`可用 ${fmtSize(s.storage.free)} · 上限 ${fmtSize(s.storage.max_bytes)}`;
 $('camera-side-dot').classList.toggle('on',online);$('side-state').textContent=online?c.recording_clip?'正在保存事件录像':s.settings.record_enabled?'智能录像已开启':'仅预览 · 尚未开启录制':'摄像头断开';$('live-dot').classList.toggle('on',online);$('live-label').textContent=c.recording_clip?'录制中':online?'画面在线':'设备离线';$('record-toggle').textContent=s.settings.record_enabled?'停止智能录像':'开启智能录像';$('record-toggle').className=s.settings.record_enabled?'btn danger':'btn primary';$('motion-chip').textContent=c.state==='motion'?'● 检测到变化':'○ 静止';$('motion-level').textContent=(levelInfo[c.level]||levelInfo.idle)[2].toUpperCase();$('motion-level').style.color=(levelInfo[c.level]||levelInfo.idle)[1];$('motion-fill').style.width=Math.min(100,c.score*8)+'%';$('motion-pct').textContent=Number(c.score).toFixed(2)+'%';$('motion-hint').textContent=c.state==='calibrating'?'正在初始化背景模型，请保持画面相对稳定。':c.state==='motion'?'发现有效前景变化。若已开启录制，将生成事件 MP4。':s.settings.record_enabled?'静止待机：只分析运动，不保存持续视频。':'当前仅实时预览；请点击开启智能录像。';
 $('offline-overlay').classList.toggle('hidden',online);$('overlay-main').textContent='摄像头未就绪';$('overlay-help').textContent=c.error||'检查 /dev/video0 权限、设备是否占用，或使用演示模式。';if(currentPage==='settings')$('storage-location').textContent=`录像目录：${s.storage.root}。为节省 SSD，推荐配置到 HDD /mnt/sda4。`;
 }catch(e){$('stat-camera').textContent='服务器断开';$('overlay-main').textContent='无法连接后端';$('overlay-help').textContent=String(e);$('offline-overlay').classList.remove('hidden')}}
+
+const zoneColors={include:'#56aeef',exclude:'#f1c15b',privacy:'#111111'};
+function currentZones(){return zoneDraft||{include:[],exclude:[],privacy:[]}}
+function zoneBounds(){
+  let cvs=$('zone-canvas'),w=cvs.clientWidth,h=cvs.clientHeight,img=$('stream');
+  let iw=img.naturalWidth||640,ih=img.naturalHeight||360,s=Math.min(w/iw,h/ih);
+  return {x:(w-iw*s)/2,y:(h-ih*s)/2,w:iw*s,h:ih*s};
+}
+function renderZones(){
+  let cvs=$('zone-canvas'),ratio=window.devicePixelRatio||1;
+  cvs.width=Math.max(1,Math.round(cvs.clientWidth*ratio));
+  cvs.height=Math.max(1,Math.round(cvs.clientHeight*ratio));
+  let ctx=cvs.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,cvs.clientWidth,cvs.clientHeight);
+  if(!zonesEditing)return;
+  let rect=zoneBounds();ctx.lineWidth=2;
+  for(let type of ['include','exclude','privacy']){
+    for(let polygon of currentZones()[type]){
+      ctx.beginPath();polygon.forEach(([x,y],i)=>i?ctx.lineTo(rect.x+x*rect.w,rect.y+y*rect.h):ctx.moveTo(rect.x+x*rect.w,rect.y+y*rect.h));
+      ctx.closePath();ctx.fillStyle=type==='privacy'?'rgba(4,7,9,.78)':type==='include'?'rgba(86,174,239,.19)':'rgba(241,193,91,.24)';
+      ctx.fill();ctx.strokeStyle=zoneColors[type];ctx.stroke();
+    }
+  }
+  if(zonePoints.length){
+    ctx.beginPath();zonePoints.forEach(([x,y],i)=>i?ctx.lineTo(rect.x+x*rect.w,rect.y+y*rect.h):ctx.moveTo(rect.x+x*rect.w,rect.y+y*rect.h));
+    ctx.strokeStyle=zoneColors[$('zone-type').value];ctx.stroke();
+    for(let [x,y] of zonePoints){ctx.beginPath();ctx.arc(rect.x+x*rect.w,rect.y+y*rect.h,4,0,Math.PI*2);ctx.fillStyle='#ffffff';ctx.fill()}
+  }
+}
+function toggleZones(){
+  if(zonesEditing){cancelZones();return}
+  zonesEditing=true;zoneDraft=JSON.parse(JSON.stringify(settings.zones||{include:[],exclude:[],privacy:[]}));zonePoints=[];
+  $('zone-canvas').classList.add('editing');$('zone-tools').classList.remove('hidden');$('zone-hint').classList.remove('hidden');
+  $('zones-toggle').textContent='退出区域编辑';renderZones();
+}
+function cancelZones(){zonesEditing=false;zoneDraft=null;zonePoints=[];$('zone-canvas').classList.remove('editing');$('zone-tools').classList.add('hidden');$('zone-hint').classList.add('hidden');$('zones-toggle').textContent='编辑监测区域';renderZones()}
+function completeZone(){
+  if(zonePoints.length<3){notify('请先绘制至少 3 个顶点',true);return}
+  let type=$('zone-type').value;
+  if(currentZones()[type].length>=8){notify('该类型最多 8 个区域',true);return}
+  // Reject near-zero-area polygons before hitting server validation.
+  let area=Math.abs(zonePoints.reduce((sum,[x,y],i)=>{let [nx,ny]=zonePoints[(i+1)%zonePoints.length];return sum+x*ny-nx*y},0)/2);
+  if(area<0.00005){notify('多边形过小，请重新绘制',true);return}
+  zoneDraft[type].push(zonePoints.map(p=>[...p]));zonePoints=[];renderZones();
+}
+$('zone-canvas').addEventListener('click',e=>{
+  if(!zonesEditing)return;
+  // Suppress the second click of a double-click; dblclick closes the polygon.
+  if(e.detail>=2)return;
+  let b=zoneBounds(),r=$('zone-canvas').getBoundingClientRect(),x=(e.clientX-r.left-b.x)/b.w,y=(e.clientY-r.top-b.y)/b.h;
+  if(x<0||x>1||y<0||y>1)return;
+  if(zonePoints.length<32)zonePoints.push([+x.toFixed(5),+y.toFixed(5)]);
+  renderZones();
+});
+$('zone-canvas').addEventListener('dblclick',e=>{if(zonesEditing){e.preventDefault();completeZone()}});
+$('zone-type').addEventListener('change',()=>{zonePoints=[];renderZones()});
+function undoZone(){if(zonePoints.length)zonePoints.pop();else currentZones()[$('zone-type').value].pop();renderZones()}
+function clearZoneType(){currentZones()[$('zone-type').value]=[];zonePoints=[];renderZones()}
+async function saveZones(){
+  if(zonePoints.length){notify('请先双击完成当前多边形',true);return}
+  if(!confirm('保存监测/隐私区域？当前录像会切段，且新遮挡无法修改历史视频。'))return;
+  try{settings=await send('/api/settings','POST',{zones:zoneDraft});cancelZones();await poll();notify('新区域已应用到后端检测和录像')}catch(e){notify('区域保存失败：'+e.message,true)}
+}
+window.addEventListener('resize',()=>{if(zonesEditing)renderZones()});
+$('stream').addEventListener('load',()=>{if(zonesEditing)renderZones()});
+
 async function toggleRecord(){try{const enabling=!settings.record_enabled;if(enabling && !confirm('确认开始本机摄像头事件录制？请确保被拍摄者知情同意。'))return;await send('/api/settings','POST',{record_enabled:enabling});await poll();notify(enabling?'已开启智能录像；静止时不写入视频':'已停止录像，当前事件将完成收尾')}catch(e){notify(e.message,true)}}
 function grade(score){return score>=8?'high':score>=2?'medium':'low'}
 function eventRow(ev,compact=false){let intensity=grade(ev.peak_score),t=localTime(ev.start,true),dt=new Date(ev.start*1000).toLocaleDateString('zh-CN');let buttons=`<button class="btn small" data-action="play" data-id="${ev.id}">播放</button><a class="btn small ghost" href="/api/events/${ev.id}/download">下载</a><button class="btn small ghost" data-action="protect" data-id="${ev.id}" data-state="${ev.protected?1:0}">${ev.protected?'★ 已保护':'☆ 保护'}</button><button class="btn small danger" data-action="delete" data-id="${ev.id}">删除</button>`;
