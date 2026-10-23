@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set +e
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+set +e # diagnostics should continue after a missing camera/tool
+cd "$PROJECT_ROOT"
 PYTHON="$(resolve_python)" || exit 1
 export PATH="$(dirname "$PYTHON"):$PATH"
 echo '===== OS / Python ====='
