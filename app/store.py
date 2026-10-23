@@ -14,6 +14,8 @@ import subprocess
 import threading
 import time
 
+from .zones import validate_zones
+
 log = logging.getLogger(__name__)
 DEFAULTS = {
     "record_enabled": False,
@@ -25,6 +27,7 @@ DEFAULTS = {
     "max_storage_gb": 20,
     "min_free_gb": 2,
     "show_boxes": True,
+    "zones": {"include": [], "exclude": [], "privacy": []},
 }
 
 
@@ -46,6 +49,11 @@ class Store:
             except (ValueError, OSError, TypeError):
                 log.warning("Could not read persisted settings; using defaults")
             self.file_cfg.chmod(0o600)
+        try:
+            cfg["zones"] = validate_zones(cfg["zones"])
+        except ValueError:
+            log.warning("Invalid persisted zones; resetting polygon regions")
+            cfg["zones"] = validate_zones(DEFAULTS["zones"])
         cfg["record_enabled"] = False  # never persist operator consent across launches
         self.cfg = cfg
         self._init_db()
@@ -100,10 +108,14 @@ class Store:
             "max_storage_gb": lambda v: type(v) in (float, int) and 1 <= v <= 2000,
             "min_free_gb": lambda v: type(v) in (float, int) and .1 <= v <= 500,
             "show_boxes": lambda v: type(v) is bool,
+            "zones": lambda v: type(v) is dict,
         }
         for key, value in change.items():
             if key not in allowed or not allowed[key](value):
                 raise ValueError(f"无效设置 {key}")
+        change = dict(change)
+        if "zones" in change:
+            change["zones"] = validate_zones(change["zones"])
         with self.lock:
             updated = dict(self.cfg)
             updated.update(change)
