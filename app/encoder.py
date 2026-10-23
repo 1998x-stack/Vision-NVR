@@ -1,6 +1,8 @@
 """Low-level FFmpeg H.264 encoder. Used only by a background writer in v3."""
 from __future__ import annotations
 import os
+import select
+import time
 from pathlib import Path
 import shutil
 import subprocess
@@ -26,16 +28,35 @@ class VideoEncoder:
         ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._stderr_log)
         self.frame_count = 0
         self.fps = fps
+        # Direct unbuffered writes avoid indefinitely blocking BufferedWriter.write.
+        os.set_blocking(self.proc.stdin.fileno(), False)
+        self.write_timeout_seconds = 5.0
 
     def append(self, frame: np.ndarray):
         if self.proc.poll() is not None:
             msg = self._error_tail()
             raise RuntimeError(f"FFmpeg 录制中断：{msg}")
+        data = memoryview(np.ascontiguousarray(frame)).cast("B")
+        offset = 0
+        fd = self.proc.stdin.fileno()
+        deadline = time.monotonic() + self.write_timeout_seconds
         try:
-            self.proc.stdin.write(frame.tobytes())
+            while offset < len(data):
+                if self.proc.poll() is not None:
+                    raise BrokenPipeError("FFmpeg process exited")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([], [fd], [], remaining)[1]:
+                    raise TimeoutError("FFmpeg stdin write exceeded deadline")
+                try:
+                    count = os.write(fd, data[offset:])
+                except BlockingIOError:
+                    continue
+                if count <= 0:
+                    raise BrokenPipeError("FFmpeg pipe closed")
+                offset += count
             self.frame_count += 1
-        except (BrokenPipeError, OSError) as exc:
-            raise RuntimeError("FFmpeg 无法写入视频；检查磁盘空间与编码支持") from exc
+        except (OSError, TimeoutError) as exc:
+            raise RuntimeError("FFmpeg 写入失败或超时；检查 CPU 和磁盘空间") from exc
 
     def _error_tail(self):
         self._stderr_log.seek(0, os.SEEK_END)
@@ -51,7 +72,7 @@ class VideoEncoder:
                 except BrokenPipeError:
                     pass
             try:
-                rc = self.proc.wait(timeout=20)
+                rc = self.proc.wait(timeout=12)
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("FFmpeg 结束录制超时") from exc
             message = self._error_tail()
