@@ -8,6 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 import logging
 import os
+import sys
 import threading
 import time
 
@@ -140,7 +141,7 @@ class FrameGrabber:
                     network = isinstance(source, str) and source.lower().startswith(
                         ("rtsp://", "rtsps://", "http://", "https://"))
                     backend = cv2.CAP_FFMPEG if network else (
-                        cv2.CAP_V4L2 if os.name == "posix" else cv2.CAP_ANY)
+                        cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY)
                     cap = cv2.VideoCapture(source, backend)
                     if not cap.isOpened():
                         cap.release()
