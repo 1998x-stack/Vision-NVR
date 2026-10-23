@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.0.0 — reliability, privacy and verification
+
+- **Security:** explicit Host allowlist on all routes (DNS rebinding), private directory and file permissions even outside the launcher.
+- **Reliability:** independent retention janitor, SQL batch quota cleanup, worker automatic restart and non-successful health responses for stale/offline capture.
+- **Recovery:** startup ffprobe reconciliation for incomplete recordings; fragmented MP4 recording improves interrupted-clip recoverability; unindexed files are reported rather than deleted.
+- **Detection:** 20-sample accelerated background settling for significant global exposure changes; webcam native aspect preserved by letterboxing.
+- **API and UI:** FastAPI app factory, event COUNT query instead of 1.3s GROUP BY, thumbnail caching, range-capable Starlette, remove unused 500-event polling, server-side time/day for UI timeline.
+- **Operations/testing:** Linux service resource priority, regression tests for camera supervisor, exposure, crash recovery, host checks and range seeking; 14 tests passing in CI on Ubuntu 22.04 and 24.04 as of the v2 candidate.
+- Remaining: FFmpeg input is still synchronous, no multi-camera or polygon privacy masks. See `docs/V2_MIGRATION.md` for upgrade and risk notes.
+
+
 ## 1.1.0 — portable Ubuntu deployment
 
 - 新增 `.env.example` 与通用 `docs/DEPLOY_UBUNTU.md`，适配多台 Ubuntu，不依赖固定用户目录。
