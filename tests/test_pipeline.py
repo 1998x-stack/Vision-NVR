@@ -167,7 +167,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertIsNone(worker.latest_frame)
                 self.assertEqual(client.get("/api/status").json()["settings"]["zones"], privacy)
                 bad = client.post("/api/settings",
-                    json={"zones":zones(include=[[[0,0],[math.inf,0],[.5,.5]]])},
+                    json={"zones":zones(include=[[[0,0],[1.2,0],[.5,.5]]])},
                     headers={"x-local-ui":"1"})
                 self.assertEqual(bad.status_code,422)
             self.assertEqual(Store(Path(directory)).settings()["zones"], privacy)
