@@ -84,11 +84,26 @@ def create_app(cfg: NVRConfig | None = None) -> FastAPI:
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; media-src 'self' blob:; "
+            "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
         return response
 
     @app.get("/", response_class=HTMLResponse)
     def home():
         return (PROJECT / "static" / "index.html").read_text("utf-8")
+
+    @app.get("/static/{filename}")
+    def static_asset(filename: str):
+        # Explicit allowlist: no user-controlled archive or arbitrary file serving.
+        types = {"app.js": "text/javascript", "app.css": "text/css"}
+        if filename not in types:
+            raise HTTPException(404)
+        return FileResponse(PROJECT / "static" / filename,
+                            media_type=types[filename],
+                            headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/api/status")
     def status(request: Request):
