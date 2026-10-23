@@ -31,6 +31,9 @@ class MotionDetector:
         self.samples = 0
         self.subtractor = cv2.createBackgroundSubtractorMOG2(history=240, varThreshold=24, detectShadows=True)
         self.last_mean: float | None = None
+        self.stable_mean: float | None = None
+        self.settle_remaining = 0
+        self.lighting_events = 0
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     def detect(self, frame: np.ndarray, threshold: float = 0.65):
@@ -38,7 +41,20 @@ class MotionDetector:
         small = cv2.resize(frame, (self.width, max(1, round(h * self.width / w))))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         mean = float(gray.mean())
-        mask = self.subtractor.apply(gray)
+        # A light switch causes a full-frame MOG2 transient lasting many samples.
+        # Use both a shift from the slow luminance baseline and the raw mask area.
+        mask = self.subtractor.apply(
+            gray, learningRate=0.4 if self.settle_remaining else -1)
+        raw_changed = float(np.count_nonzero(mask == 255)) / mask.size * 100.0
+        if self.stable_mean is None:
+            self.stable_mean = mean
+        if (self.samples > self.warmup and self.settle_remaining == 0
+                and abs(mean - self.stable_mean) >= 12 and raw_changed >= 35):
+            self.settle_remaining = 20
+            self.lighting_events += 1
+            # Rapidly relearn the global exposure while suppressing transients.
+            self.subtractor.apply(gray, learningRate=0.5)
+            self.stable_mean = mean
         self.samples += 1
         mask = cv2.threshold(mask, 250, 255, cv2.THRESH_BINARY)[1]  # suppress gray shadow label
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
@@ -56,11 +72,15 @@ class MotionDetector:
             significant_area += area
             rectangles.append((int(x * sx), int(y * sy), int(ww * sx), int(hh * sy)))
         pct = 100.0 * significant_area / mask.size
-        brightness_jump = self.last_mean is not None and abs(mean - self.last_mean) >= 24
         self.last_mean = mean
-        # Major auto-exposure / light-switch jumps are ignored for this sampled frame.
-        if self.samples <= self.warmup or (brightness_jump and pct > 30):
+        if self.samples <= self.warmup:
+            self.stable_mean = mean
             return 0.0, [], False
+        if self.settle_remaining:
+            self.settle_remaining -= 1
+            self.stable_mean = mean
+            return 0.0, [], False
+        self.stable_mean = 0.98 * self.stable_mean + 0.02 * mean
         return round(pct, 3), rectangles[:8], pct >= threshold
 
 
@@ -80,14 +100,16 @@ class VideoEncoder:
         if not binary:
             raise RuntimeError("找不到 FFmpeg。请先激活含 ffmpeg 的 Conda 环境。")
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._stderr_log = tempfile.TemporaryFile(mode="w+b")
         self.proc = subprocess.Popen([
             binary, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pixel_format", "bgr24", "-video_size", f"{width}x{height}",
             "-framerate", str(fps), "-i", "pipe:0", "-an", "-c:v", "libx264",
             "-preset", "veryfast", "-crf", "29", "-pix_fmt", "yuv420p",
-            "-g", str(fps * 2), "-movflags", "+faststart", "-f", "mp4", str(path)
+            "-threads", "2", "-g", str(fps * 2),
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4", str(path)
         ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._stderr_log)
         self.frame_count = 0
         self.fps = fps
@@ -156,6 +178,11 @@ class CameraWorker:
         self.last_frame = 0.0
         self.last_event_id: str | None = None
         self.frames_processed = 0
+        self.loop_restarts = 0
+        self.last_cleanup_seconds = 0.0
+        self.last_cleanup_removed = 0
+        self.janitor_stop = threading.Event()
+        self.janitor_thread: threading.Thread | None = None
         self.detector = MotionDetector()
         # Volatile motion indicators for last 180 seconds, never saved to disk.
         self.activity_seconds: deque[tuple[int, str]] = deque(maxlen=180)
@@ -164,15 +191,52 @@ class CameraWorker:
         if self.thread and self.thread.is_alive():
             return
         self.running = True
-        self.thread = threading.Thread(target=self._loop, name="camera-capture", daemon=True)
+        self.janitor_stop.clear()
+        self.janitor_thread = threading.Thread(
+            target=self._janitor, name="nvr-janitor", daemon=True)
+        self.janitor_thread.start()
+        self.thread = threading.Thread(
+            target=self._supervise, name="camera-supervisor", daemon=True)
         self.thread.start()
 
     def stop(self):
         self.running = False
+        self.janitor_stop.set()
         with self.condition:
             self.condition.notify_all()
         if self.thread:
             self.thread.join(timeout=35)
+        if self.janitor_thread:
+            self.janitor_thread.join(timeout=3)
+
+    def _janitor(self):
+        while not self.janitor_stop.is_set():
+            start = time.monotonic()
+            try:
+                deleted = self.store.cleanup()
+                with self.lock:
+                    self.last_cleanup_removed = deleted
+            except Exception:
+                log.exception("background retention failed")
+            with self.lock:
+                self.last_cleanup_seconds = time.monotonic() - start
+            if self.janitor_stop.wait(120):
+                break
+
+    def _supervise(self):
+        # _loop finalizes the encoder and releases the camera on exit.
+        # An unexpected exit should not silently disable the NVR forever.
+        while self.running:
+            try:
+                self._loop()
+            except Exception:
+                log.exception("camera supervisor caught unexpected exception")
+            if self.running:
+                with self.lock:
+                    self.loop_restarts += 1
+                    self.online = False
+                    self.state = "recovering"
+                time.sleep(1)
 
     def status(self):
         with self.lock:
@@ -180,6 +244,12 @@ class CameraWorker:
                 "online": self.online, "state": self.state, "error": self.error,
                 "score": self.score, "level": self.activity_level, "recording_clip": self.rec_active,
                 "last_frame": self.last_frame, "fps_target": self.fps,
+                "frames_processed": self.frames_processed,
+                "worker_alive": bool(self.thread and self.thread.is_alive()),
+                "loop_restarts": self.loop_restarts,
+                "lighting_changes_ignored": self.detector.lighting_events,
+                "last_cleanup_seconds": round(self.last_cleanup_seconds, 3),
+                "last_cleanup_removed": self.last_cleanup_removed,
                 "source": "模拟演示画面" if self.demo else self.camera,
                 "last_event_id": self.last_event_id,
                 "activity_seconds": list(self.activity_seconds),
@@ -215,6 +285,16 @@ class CameraWorker:
             cv2.circle(frame, (px, 191), 29, (160, 180, 220), -1)
         return frame
 
+    def _letterbox(self, frame):
+        h, w = frame.shape[:2]
+        scale = min(self.width / w, self.height / h)
+        resized = cv2.resize(frame, (max(1, round(w * scale)), max(1, round(h * scale))))
+        out = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        rh, rw = resized.shape[:2]
+        x, y = (self.width - rw) // 2, (self.height - rh) // 2
+        out[y:y + rh, x:x + rw] = resized
+        return out
+
     def _loop(self):
         cap = None
         encoder = None
@@ -224,25 +304,21 @@ class CameraWorker:
         last_motion = 0.0
         last_preview = 0.0
         started_at = time.monotonic()
-        last_cleanup = 0.0
         next_frame = 0.0
         open_retry = 0.0
         try:
             while self.running:
                 now = time.monotonic()
-                if now - last_cleanup > 120:
-                    try:
-                        self.store.cleanup()
-                    except Exception:
-                        log.exception("cleanup error")
-                    last_cleanup = now
-
                 if not self.demo and cap is None:
                     if now < open_retry:
                         time.sleep(.3)
                         continue
                     source = int(self.camera) if self.camera.isdecimal() else self.camera
-                    cap = cv2.VideoCapture(source, cv2.CAP_V4L2 if os.name == "posix" else cv2.CAP_ANY)
+                    network = isinstance(source, str) and source.lower().startswith(
+                        ("rtsp://", "rtsps://", "http://", "https://"))
+                    backend = cv2.CAP_FFMPEG if network else (
+                        cv2.CAP_V4L2 if os.name == "posix" else cv2.CAP_ANY)
+                    cap = cv2.VideoCapture(source, backend)
                     if not cap.isOpened():
                         cap.release()
                         cap = None
@@ -255,6 +331,7 @@ class CameraWorker:
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                     cap.set(cv2.CAP_PROP_FPS, self.fps)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # best-effort for V4L2
                     with self.lock:
                         self.error = ""
                     self.detector = MotionDetector()
@@ -280,7 +357,8 @@ class CameraWorker:
                         self.online, self.state, self.error = False, "offline", "摄像头读取失败，正在重连"
                     time.sleep(1)
                     continue
-                frame = cv2.resize(frame, (self.width, self.height))
+                # Preserve source aspect ratio instead of squashing 4:3 UVC video.
+                frame = self._letterbox(frame)
                 self.frames_processed += 1
                 score, boxes, motion = self.detector.detect(frame, self.store.settings()["sensitivity"])
                 with self.lock:
@@ -325,7 +403,7 @@ class CameraWorker:
                             ev = {"id": event_id, "start": event_ts, "score": score,
                                   "thumb": poster, "last_update": now}
                             thumb_frame = buffer[-1][1] if buffer else frame
-                            (self.store.path / poster).parent.mkdir(parents=True, exist_ok=True)
+                            (self.store.path / poster).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                             cv2.imwrite(str(self.store.path / poster), thumb_frame, [cv2.IMWRITE_JPEG_QUALITY, 79])
                             with self.lock:
                                 self.last_event_id = event_id
@@ -339,6 +417,9 @@ class CameraWorker:
                                     encoder.close()
                                 except Exception:
                                     pass
+                                encoder.path.unlink(missing_ok=True)
+                            self.store.remove_event(event_id)
+                            (self.store.path / poster).unlink(missing_ok=True)
                             encoder, ev = None, None
                 if encoder:
                     try:
