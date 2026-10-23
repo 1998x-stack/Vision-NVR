@@ -38,6 +38,7 @@ class SettingsUpdate(BaseModel):
     max_storage_gb: float | None = None
     min_free_gb: float | None = None
     show_boxes: bool | None = None
+    zones: dict | None = None
 
 
 class Protected(BaseModel):
@@ -151,9 +152,12 @@ def create_app(cfg: NVRConfig | None = None) -> FastAPI:
     @app.post("/api/settings")
     def settings_change(payload: SettingsUpdate, request: Request):
         require_local_action(request)
+        params = payload.model_dump(exclude_none=True)
         try:
-            return request.app.state.store.update_settings(
-                payload.model_dump(exclude_none=True))
+            result = request.app.state.store.update_settings(params)
+            if "zones" in params:
+                request.app.state.worker.invalidate_preview()
+            return result
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
