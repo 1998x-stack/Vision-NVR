@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from .engine import VideoEncoder
+from .encoder import VideoEncoder
 
 log = logging.getLogger(__name__)
 
